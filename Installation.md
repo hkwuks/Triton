@@ -5,7 +5,9 @@ Triton is not support Windows right now. Please install it on Linux.
 ## Binary Distributions
 
 You can install the latest stable release of Trition from pip:
+
 `pip install triton`
+
 Binary wheels are available for CPython 3.9-3.13.
 
 ## From Source
