@@ -122,4 +122,4 @@ We can now run the decorated function above. Pass *print_data=True* to see the p
 benchmark.run(print_data=True, show_plots=True)
 ```
 
-![[vector_additon_performance.png]]
+![[assets/vector_additon_performance.png]]
