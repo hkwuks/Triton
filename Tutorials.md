@@ -123,3 +123,89 @@ benchmark.run(print_data=True, show_plots=True)
 ```
 
 ![performance](assets/vector_additon_performance.png)
+
+## Fused Softmax
+
+In this tutorial, you will write a fused softmax operation that is significantly than PyTorch's native op for a particular class of matrices: those whose rows can fit in the GPU's SRAM.
+
+In doing so, you will learn about:
+
+- The benefits of kernel fusion (内核融合) for bandwidth-bound (带宽受限) operations.
+- Reduction operators in Triton.
+
+### Motivations
+
+Custom GPU kernels for elementwise additons are educationally valuable but won't get you very far in practice. Let us consider instead the case of a simple (numerically stabilized) softmax operation:
+
+```python
+import torch  
+import triton  
+import triton.language as tl  
+from triton.runtime import driver  
+  
+DEVICE = triton.runtime.driver.active.get_active_torch_device()  
+  
+  
+def is_hip():  
+    return triton.runtime.driver.active.get_current_target().backend == 'hip'  
+  
+  
+def is_cdna():  
+    return is_hip() and triton.runtime.driver.active.get_current_target().arch in ('gfx940', 'gfx941', 'gfx942',  
+                                                                                   'gfx90a', 'gfx908')  
+  
+  
+def naive_softmax(x):  
+    '''Compute row-wise softmax of X using native pytorch  
+  
+    We subtract the maximum element in order to avoid overflows. Softmax is invariant(不变的) to this shift.  
+    '''  
+    # read MN elements; write M elements  
+    x_max = x.max(dim=1).values  
+    # read MN + M elements; write MN elements  
+    z = x - x_max[:, None]  
+    # read MN elements; write MN elements  
+    numerator = torch.exp(z)  
+    # read MN elements; write M elements  
+    denominator = numerator.sum(dim=1)  
+    # read MN + M elements; write MN elements  
+    ret = numerator / denominator[:, None]  
+    # in total: read 5MN + 2M elements; wrote 3MN + 2M elements  
+    return ret
+```
+
+Computing `y = naive_softmax(x)` for $x \in R^{M \times N}$ requires reading $5MN + 2M$ elements from DRAM and write back $3MN + 2M$ elements. This is obviously wasteful; we'd prefer to have a custom "fused" kenel that only reads X once and does all the necessary computations on-chip. Doing so would require reading and writing back only $MN$ bytes, so we could expect a theoretical speed-up of ~4x. The `torch.jit.script` flags aims to perform this kind of "kernel fusion" automatically but, as we will see later, ti is still far from ideal.
+
+### Compute Kernel
+
+Our softmax kernel works as follows: each program loads a set of rows of the input matrix X strided by number of programs, normalizes it and writes back the result to the output Y.
+
+Note that one important limitation of Triton is that each block must have a power-of-two number of elements, so we need to internally "pad" each row and guard the memory operations properly if we want to handle any possible input shapes:
+
+```python
+@triton.jit  
+def softmax_kernel(output_ptr, input_ptr, input_row_stride, output_row_stride, n_rows, n_cols, BLOCK_SIZE: tl.constexpr,  
+                   num_stages: tl.constexpr):  
+    # starting row of the program  
+    row_start = tl.program_id(0)  
+    row_step = tl.num_programs(0)  
+    for row_idx in tl.range(row_start, n_rows, row_step, num_stages=num_stages):  
+        # The stride represents how much we need to increase the pointer to advance 1 row  
+        row_start_ptr = input_ptr + row_idx * input_row_stride  
+        # The block size is the next power of two greater than n_cols, so we can fit each row in a single block  
+        col_offsets = tl.arange(0, BLOCK_SIZE)  
+        input_ptrs = row_start_ptr + col_offsets  
+        # Load the row into SRAM, using a mask since BLOCK_SIZE may be bigger than n_cols  
+        mask = col_offsets < n_cols  
+        row = tl.load(input_ptrs, mask=mask, other=-float('inf'))  
+        # Subtract maximum for numerical stability  
+        row_minus_max = row - tl.max(row, axis=0)  
+        # Note that exponentiation in Triton is fast but approximate(近似的)  
+        numerator = tl.exp(row_minus_max)  
+        denominator = tl.sum(numerator, axis=0)  
+        softmax_output = numerator / denominator  
+        # Write back output to DRAM  
+        output_row_start_ptr = output_ptr + row_idx * output_row_stride  
+        output_ptrs = output_row_start_ptr + col_offsets  
+        tl.store(output_ptrs, softmax_output, mask=mask)
+```
