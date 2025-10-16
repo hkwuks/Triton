@@ -323,3 +323,19 @@ benchmark.run(show_plots=True, print_data=True)
 ```
 
 ![02 fused softmax](assets/sphx_glr_02-fused-softmax_001.png)
+
+## Matrix Multiplication
+
+This tutorial will write a very short high-performance FP16 matrix multiplication kernel that achieves performance on par with cuBLAS or rocBLAS.
+
+- Block-level matrix multiplications
+- Multi-dimensional pointer arithmetic
+- Program re-ordering for improved L2 cache hit rate
+- Automatic performance tuning
+
+### Motivations
+
+Matrix multiplications are a key building block of most modern high-performance computing systems. They are notoriously hard to optimize, hence their implementation is generally done by hardware vendors themselves as part of so-called “kernel libraries”(e.g., cuBLAS).
+
+Unfortunately, these libraries are often propritary and cannot be easily customized to accommodate the needs of modern deep learning workloads. 
+
