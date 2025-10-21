@@ -337,5 +337,44 @@ This tutorial will write a very short high-performance FP16 matrix multiplicatio
 
 Matrix multiplications are a key building block of most modern high-performance computing systems. They are notoriously hard to optimize, hence their implementation is generally done by hardware vendors themselves as part of so-called “kernel libraries”(e.g., cuBLAS).
 
-Unfortunately, these libraries are often propritary and cannot be easily customized to accommodate the needs of modern deep learning workloads. 
+Unfortunately, these libraries are often proprietary and cannot be easily customized to accommodate the needs of modern deep learning workloads. 
+
+Roughly speaking, the kernel that we will write implement the following blocked algorithm to multiply a(M, K) by a(K, N) matrix:
+
+```python
+# Do in parallel
+for m in range(0, M, BLOCK_SIZE_M):
+    # Do in parallel
+    for n in range(0, N, BLOCK_SIZE_N):
+        acc = zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=float32)
+        for k in range(0, K, BLOCK_SIZE_K):
+            a = A[m : m+BLOCK_SIZE_M, k : k+BLOCK_SIZE_K]
+            b = B[k : k+BLOCK_SIZE_K, n : n+BLOCK_SIZE_N]
+            acc += dot(a, b)
+        C[m : m+BLOCK_SZIE_M, n : n+BLOCK_SIZE_N] = acc
+```
+
+Where each iteration of the doubly-nested for-loop is performed by a dedicated Triton program instance.
+
+### Compute Kernel
+
+The above algorithm is, actually, fairly straightforward to implement in Triton. The main diffculty comes from the computation of the memory locations at which blocks of `A` and `B` must be read in the inner loop. For that, we need multi-dimensional pointer arithmetic.
+
+#### Pointer Arithmetic
+
+For a row-major 2D tensor `X`, the memory location of `X[i, j]` is given by `&X[i, j] = X + i * stride_xi + j * stride_xj`. Therefore, blocks of pointers for `A[m : m+BLOCK_SIZE_M, k : k+BLOCK_SIZE_K]` and `B[k : k+BLOCK_SIZE_K, n : n+BLOCK_SIZE_N]` can be defined in pseudo-code as:
+
+```C++
+&A[m : m+BLOCK_SZIE_M, k : k+BLOCK_SIZE_K] = a_ptr + (m : m+BLOCK_SIZE_M)[:, None] * A.stride(0) + (k : k+BLOCK_SIZE_K)[None, :]*A.stride(1);
+&B[k : k+BLOCK_SIZE_K, n:n+BLOCK_SIZE_N] =  b_ptr + (k : k+BLOCK_SIZE_K)[:, None]*B.stride(0) + (n : n+BLOCK_SIZE_N)[None, :]*B.stride(1);
+```
+
+Which means that pointers for blocks of A and B can be initialized in Triton as the following code. Also note that we need an extra module to handle the case where `M` is not a multiple of `BLOCK_SIZE_M` or `N` is not a multiple of `BLOCK_SIZE_N`, in which case we can pad the data with some unsless values, which will not contribute to the results. For the `K` dimension, we will handle that later using masking load semantics.
+
+```python
+offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+offs_an = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+offs_k = tl.arange(0, BLOCK_SIZE_K)
+a_ptrs = a_ptr + ()
+```
 
