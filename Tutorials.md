@@ -369,12 +369,68 @@ For a row-major 2D tensor `X`, the memory location of `X[i, j]` is given by `&X[
 &B[k : k+BLOCK_SIZE_K, n:n+BLOCK_SIZE_N] =  b_ptr + (k : k+BLOCK_SIZE_K)[:, None]*B.stride(0) + (n : n+BLOCK_SIZE_N)[None, :]*B.stride(1);
 ```
 
-Which means that pointers for blocks of A and B can be initialized in Triton as the following code. Also note that we need an extra module to handle the case where `M` is not a multiple of `BLOCK_SIZE_M` or `N` is not a multiple of `BLOCK_SIZE_N`, in which case we can pad the data with some unsless values, which will not contribute to the results. For the `K` dimension, we will handle that later using masking load semantics.
+Which means that pointers for blocks of A and B can be initialized in Triton as the following code. Also note that we need an extra module to handle the case where `M` is not a multiple of `BLOCK_SIZE_M` or `N` is not a multiple of `BLOCK_SIZE_N`, in which case we can pad the data with some useless values, which will not contribute to the results. For the `K` dimension, we will handle that later using masking load semantics.
 
 ```python
 offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
 offs_an = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
 offs_k = tl.arange(0, BLOCK_SIZE_K)
-a_ptrs = a_ptr + ()
+a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+b_ptrs = b_ptr + (offs_k[:, None] * stride_dk + offs_bn[None, :] * stride_bn)
+```
+
+And then updated in the inner loop as follows:
+
+```python
+a_ptrs += BLOCK_SIZE_K * stride_ak
+b_ptrs += BLOCK_SIZE_K * stride_bk
+```
+
+#### L2 Cache Optimizations
+
+As mentioned above, each program instance computes a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block of `C`. It is important to remember that the order in which these blocks are computed, since it affects the L2 cache hit rate of our program, and unfortunately, a simple row-major ordering
+
+```python
+pid = tl.program_id(axis=0)
+grid_n = tl.cdiv(N, BLOCK_SIZE_N)
+pid_m = pid // grid_n
+pid_n = pid % grid_n
+```
+
+is just not going to cut it.
+
+One possible solution is to launch blocks in an order that promotes data reuse. This can be done by ‘super-grouping’ blocks in groups of `GROUP_M` rows before switching to the next column:
+
+```python
+# Program ID
+pid = tl.program_id(axis=0)
+# Number of programs ids along the M axis
+num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+# Number of programs ids along the N axis
+num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+# Number of programs in group
+num_pid_in_group = GROUP_SIZE_M * num_pid_n
+# Id of the group this program is in 
+group_id = pid // num_pid_in_group
+# Row-id of the first program in the group
+first_pid_m = group_id * GROUP_SIZE_M
+# If `num_pid_m` isn't divisible by `GROUP_SIZE_M`, the last group is smaller
+group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+# *Within groups*, programs are ordered in a column-major order
+# Row-id of the program in the *launch grid*
+pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+# Col-id of the program in the *launch grid*
+pid_n = (pid % num_pid_in_group) // group_size_m
+```
+
+For example, in the following matmul where each matrix is 9 blocks by 9 blocks, we can see that if we compute the output in row-major ordering, we need to load 90 blocks into SRAM to compute the first 9 output blocks, but if we do it in grouped ordering, we only need to load 54 blocks.
+
+![](assets/grouped_vs_row_major_ordering.png)
+
+In practice, this can improve the performance of our matrix multiplication kernel by more than 10% on some hardware architecture(e.g., 220 to 245 TFLOPS on A100).
+
+#### Final Result
+
+```python
 ```
 
